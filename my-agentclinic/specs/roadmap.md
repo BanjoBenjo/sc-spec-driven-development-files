@@ -2,9 +2,9 @@
 
 ## Phase 1 - Home Shell
 
-- [ ] Create a minimal home page that introduces AgentClinic and its two user surfaces.
-- [ ] Add a basic application shell that can support future navigation.
-- [ ] Ensure the starter app runs cleanly in the chosen framework.
+- [x] Create a minimal home route that establishes the initial application shell.
+- [x] Add a basic application shell that can support future navigation.
+- [x] Ensure the starter app runs cleanly in the chosen framework with automated validation.
 
 ## Phase 2 - SQLite App Setup
 

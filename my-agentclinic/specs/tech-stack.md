@@ -6,7 +6,11 @@ AgentClinic uses server-side TypeScript for both the web application and the API
 
 Recommended framework:
 
-- Next.js as a full-stack TypeScript application
+- TanStack Start as a full-stack TypeScript application
+
+Validation and testing:
+
+- Vitest for automated validation of app shell behavior, build readiness, and lightweight integration checks
 
 Initial database:
 
@@ -15,7 +19,7 @@ Initial database:
 This stack is a fit for the project because it gives us:
 
 - a popular and reliable TypeScript-based foundation
-- one application that can serve both dashboard pages and API routes
+- one application that can serve both app routes and server endpoints
 - a low-friction database choice for local development, demos, and course work
 
 ## Application Shape
@@ -23,21 +27,23 @@ This stack is a fit for the project because it gives us:
 The app has two main surfaces:
 
 - Dashboard pages for staff and humans monitoring agent health
-- API endpoints for agent registration, visits, diagnosis results, and follow-up reporting
+- Server routes for agent registration, visits, diagnosis results, and follow-up reporting
 
 The first versions should keep both surfaces in a single deployable app unless there is a clear reason to split them later.
 
 ## Initial Technical Decisions
 
 - Use TypeScript everywhere.
+- Favor TanStack Start's built-in routing and server capabilities before adding extra abstractions.
 - Favor server-rendered or server-driven pages for the dashboard where practical.
 - Keep API responses JSON-based and easy for other systems to consume.
 - Store application data in SQLite during the early phases.
+- Use Vitest as the default automated validation framework for implementation slices.
 - Keep dependencies conservative; prefer built-in framework capabilities before adding new libraries.
 
 ## Constraints
 
-- New dependencies should only be introduced when the built-in Next.js and TypeScript toolchain is not enough.
+- New dependencies should only be introduced when the built-in TanStack Start and TypeScript toolchain is not enough.
 - The project should remain easy to run locally for students and demo environments.
 - Architecture decisions in early phases should optimize for clarity and momentum, not premature scale.
 

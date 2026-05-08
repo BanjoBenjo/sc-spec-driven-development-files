@@ -1,7 +1,17 @@
 # AgentClinic
 
-## Input from stakeholders
+Minimal TanStack Start home shell for the AgentClinic product demo.
 
-- Mary in engineering wants a reliable site with a popular stack based on TypeScript, giving agents and staff a dashboard for easy access.
-- Susan in product has a set of features about agents and their ailments, therapies, and booking appointments.
-- Steve in marketing wants an attractive site that works well with a modern browser.
+## Scripts
+
+- `npm run dev` starts the local development server on port `3000`.
+- `npm run build` builds the TanStack Start application.
+- `npm run typecheck` runs TypeScript without emitting files.
+
+## Current Scope
+
+This implementation covers the roadmap's Home Shell phase:
+
+- TanStack Start bootstrap
+- reusable root shell
+- landing page framing the clinic API and operator dashboard
