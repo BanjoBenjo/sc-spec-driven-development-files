@@ -61,16 +61,18 @@ The medical metaphor is deliberate and load-bearing. "Hallucination" is already 
 | State | Trigger | Meaning |
 |-------|---------|---------|
 | **TRIAGE** | Agent calls `POST /visits` with symptom text | Symptoms received; severity and urgency assigned |
-| **DIAGNOSED** | Triage completes symptom classification | Ailment(s) identified from catalog; if no match, a novel ailment record is created with `status: unverified` |
-| **PRESCRIBED** | Diagnosis completes | Treatment instructions generated and returned to caller |
-| **AWAITING_FOLLOWUP** | Prescription delivered | Waiting for the agent (or its orchestrator) to report outcome. Auto-closes after configurable window (default: 72 hours) with `outcome: unknown` |
-| **RESOLVED** | Follow-up reports improvement | Visit closed. Treatment effectiveness score incremented for this ailment-treatment pair |
-| **UNRESOLVED** | Follow-up reports no improvement | Visit closed. Treatment effectiveness score decremented. If same ailment recurs within 7 days → `recurrence_flag: true` on the new visit |
+| **DIAGNOSED** | Triage completes symptom classification | Ailment(s) identified from catalog; if no known ailment reaches 0.4 confidence, a custom ailment is auto-created with `status: auto_detected` |
+| **PRESCRIBED** | Diagnosis completes | Treatment instructions generated and/or manual referral attached and returned to caller |
+| **AWAITING_FOLLOWUP** | Prescription or referral delivered | Waiting for the agent (or its orchestrator) to report outcome. Auto-closes after configurable window (default: 72 hours) with `outcome: unknown` |
+| **RESOLVED** | All submitted diagnosis outcomes are `improved` | Visit closed. Treatment effectiveness score incremented for each improved ailment-treatment pair |
+| **UNRESOLVED** | Any submitted diagnosis outcome is `no_change` or `worsened` | Visit closed. Treatment effectiveness score decremented for the affected ailment-treatment pair(s). If same ailment recurs within 7 days → `recurrence_flag: true` on the new visit |
 | **EXPIRED** | No follow-up within window | Visit closed with `outcome: unknown`. Does not affect treatment effectiveness scores (absence of data ≠ failure) |
 
 ### Severity Levels
 
 Triage assigns one of four severity levels. Severity affects treatment selection priority (higher severity → more aggressive treatments) and dashboard alerting.
+
+In MVP, ailment-specific severity modifiers read from patient `tags` and visit `metadata` rather than a dedicated schema field. For example, a `medical` tag or `metadata.domain = "financial"` can trigger a higher severity for hallucination risk.
 
 | Severity | Label | Criteria | Example |
 |----------|-------|----------|---------|
@@ -112,8 +114,9 @@ For each candidate ailment from triage, the diagnosis step computes a confidence
 
 1. **Symptom pattern matching:** Compare `symptom_text` against the ailment's registered `symptom_patterns` using the LLM as a semantic matcher. The LLM scores each pattern from 0-1, and the ailment's confidence is the max pattern score.
 2. **History weighting:** If this patient has been diagnosed with this ailment before, confidence gets a +0.1 boost (recurrence makes the same diagnosis more likely). Capped at 1.0.
-3. **Threshold:** Confidence ≥ 0.6 → confirmed diagnosis. Confidence 0.4-0.59 → diagnosis included but flagged as `uncertain`. Confidence < 0.4 → excluded.
-4. **No match:** If no ailment reaches 0.4 confidence, the system auto-creates a custom ailment from the symptom text and assigns `confidence: 0.5, status: auto_detected`.
+3. **Threshold:** Confidence ≥ 0.6 → confirmed diagnosis. Confidence 0.4-0.59 → diagnosis included with `status: uncertain` but receives no prescription in MVP. Confidence < 0.4 → excluded.
+4. **No match:** If no ailment reaches 0.4 confidence and the symptom text is specific enough to classify, the system auto-creates a custom ailment from the symptom text and assigns `confidence: 0.5, status: auto_detected`.
+5. **Too vague to classify:** If the symptom text is too short or vague to support any diagnosis (for example, "something is wrong"), the request is rejected with `422 UNDIAGNOSABLE` instead of creating a custom ailment.
 
 ### Multi-Diagnosis
 
@@ -134,7 +137,7 @@ All endpoints return JSON. Authentication is via API key in the `Authorization: 
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/patients` | Register a new agent patient. Returns `patient_id` |
+| `POST` | `/patients` | Register a new agent patient. Requires caller-supplied `external_agent_id`. Returns `patient_id` |
 | `GET` | `/patients/:id` | Retrieve patient record including chronic conditions and visit summary |
 | `PATCH` | `/patients/:id` | Update patient metadata (e.g., new version, changed environment) |
 | `GET` | `/patients` | List patients with filtering (`?status=active&owner=research-team&tag=production`) |
@@ -144,9 +147,9 @@ All endpoints return JSON. Authentication is via API key in the `Authorization: 
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/visits` | Start a new visit. Body: `{ "patient_id": "...", "symptom_text": "...", "metadata": {} }`. Runs triage → diagnosis → treatment synchronously. Returns complete visit record with prescriptions. |
+| `POST` | `/visits` | Start a new visit. Body: `{ "patient_id": "...", "symptom_text": "...", "metadata": {} }`. Runs triage → diagnosis → treatment synchronously. Returns complete visit record with confirmed prescriptions plus any uncertain diagnoses for operator visibility. |
 | `GET` | `/visits/:id` | Retrieve visit record |
-| `POST` | `/visits/:id/followup` | Submit follow-up outcome. Body: `{ "outcome": "improved", "outcome_text": "...", "metrics": {} }` |
+| `POST` | `/visits/:id/followup` | Submit follow-up outcomes per prescribed diagnosis. Body: `{ "diagnosis_outcomes": [{ "ailment_code": "...", "treatment_code": "...", "outcome": "improved", "outcome_text": "...", "metrics": {} }], "summary_text": "..." }` |
 | `GET` | `/visits` | List visits with filtering (`?patient_id=&state=&severity=&ailment=`) |
 
 The `POST /visits` endpoint is the primary integration point. A single API call performs the full triage → diagnosis → treatment pipeline and returns prescriptions. The calling system receives everything it needs in one response — no multi-step API choreography required.
@@ -163,7 +166,7 @@ The `POST /visits` endpoint is the primary integration point. A single API call 
                                                                                       │
                       POST /visits/:id/followup                                       │
                    ←──────────────────────────────────────────────────────────────────┘
-                      { outcome: "improved" }
+                      { diagnosis_outcomes: [...] }
 ```
 
 #### Catalog Management
@@ -198,6 +201,7 @@ The `POST /visits` endpoint is the primary integration point. A single API call 
     {
       "ailment_code": "HAL-001",
       "ailment_name": "Hallucination",
+      "status": "confirmed",
       "confidence": 0.91,
       "matched_patterns": ["fabricating", "confident but wrong"],
       "severity_adjusted": 3
@@ -205,6 +209,7 @@ The `POST /visits` endpoint is the primary integration point. A single API call 
     {
       "ailment_code": "CTX-001",
       "ailment_name": "Context Rot",
+      "status": "confirmed",
       "confidence": 0.67,
       "matched_patterns": ["forgetting established facts"],
       "severity_adjusted": 2
@@ -248,7 +253,7 @@ The `POST /visits` endpoint is the primary integration point. A single API call 
 | 404 | `VISIT_NOT_FOUND` | Unknown `visit_id` |
 | 409 | `VISIT_ALREADY_CLOSED` | Follow-up submitted for a visit in terminal state (RESOLVED/UNRESOLVED/EXPIRED) |
 | 410 | `PATIENT_SUSPENDED` | Patient is suspended; new visits blocked |
-| 422 | `UNDIAGNOSABLE` | Symptom text too vague to match any ailment and too vague to auto-create a custom ailment. Response includes `suggestion: "Please describe specific symptoms..."` |
+| 422 | `UNDIAGNOSABLE` | Symptom text is too vague or too short to support any diagnosis. Response includes `suggestion: "Please describe specific symptoms..."` |
 | 429 | `RATE_LIMITED` | Per-patient rate limit exceeded (default: 10 visits/hour) |
 
 ## Integration Example
@@ -267,6 +272,7 @@ CLINIC_KEY = "sk-clinic-..."
 
 # 1. Register (once, on agent startup)
 patient = requests.post(f"{CLINIC_URL}/patients", json={
+    "external_agent_id": "researchbot-7-prod",
     "agent_name": "ResearchBot-7",
     "model": "claude-sonnet-4-20250514",
     "framework": "langchain",
@@ -308,9 +314,23 @@ for rx in visit["prescriptions"]:
 
 # 4. Follow up (after next agent run)
 requests.post(f"{CLINIC_URL}/visits/{visit['visit_id']}/followup", json={
-    "outcome": "improved",
-    "outcome_text": "Hallucination rate dropped from 0.34 to 0.02 after context infusion. Agent correctly cited 14/14 sources in subsequent response.",
-    "metrics": {"hallucination_rate": 0.02}
+    "diagnosis_outcomes": [
+        {
+            "ailment_code": "HAL-001",
+            "treatment_code": "CTX-INF",
+            "outcome": "improved",
+            "outcome_text": "Hallucination rate dropped from 0.34 to 0.02 after context infusion. Agent correctly cited 14/14 sources in subsequent response.",
+            "metrics": {"hallucination_rate": 0.02}
+        },
+        {
+            "ailment_code": "CTX-001",
+            "treatment_code": "MEM-FLS",
+            "outcome": "improved",
+            "outcome_text": "The agent retained the user's original research question after the memory flush.",
+            "metrics": {"retained_context_turns": 12}
+        }
+    ],
+    "summary_text": "Both prescribed treatments improved the next run."
 }, headers={"Authorization": f"Bearer {CLINIC_KEY}"})
 ```
 
@@ -344,7 +364,8 @@ Each ailment has a canonical name, ICD-style code (for machine use), symptom pat
 │   2. Grounding Injection (GND-INJ) — 65% effective                        │
 │   3. Temperature Reduction (TMP-RED) — 52% effective                      │
 │                                                                            │
-│ Severity Modifier: +1 if agent handles medical/legal/financial content    │
+│ Severity Modifier: +1 if patient tags or visit metadata indicate          │
+│ medical/legal/financial content                                           │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -375,9 +396,9 @@ Categories group ailments for dashboard analytics and treatment routing.
 
 ### Custom Ailments
 
-Operators can register custom ailments via `POST /ailments` with a name, description, symptom patterns, and category. Custom ailments start with `status: unverified` and `effectiveness_data: null`. They enter the catalog alongside core ailments but are excluded from effectiveness rankings until they have ≥5 resolved visits.
+Operators can register custom ailments via `POST /ailments` with a name, description, symptom patterns, and category. Operator-created custom ailments start with `status: unverified` and `effectiveness_data: null`. They enter the catalog alongside core ailments but are excluded from effectiveness rankings until they have ≥5 resolved diagnosis outcomes.
 
-The diagnosis engine also auto-creates custom ailments when an agent's symptoms don't match any existing ailment above a 0.6 similarity threshold. Auto-created ailments get `status: auto_detected` and are flagged on the dashboard for operator review.
+The diagnosis engine auto-creates a custom ailment only when no known ailment reaches 0.4 confidence and the symptom text is still specific enough to classify. Auto-created ailments get `status: auto_detected` and are flagged on the dashboard for operator review.
 
 ### Core Treatments
 
@@ -403,16 +424,18 @@ When a diagnosis identifies one or more ailments, the treatment selection engine
 1. Retrieves all treatments associated with each diagnosed ailment
 2. Ranks treatments by **effectiveness score** for that specific ailment (see Treatment Effectiveness section)
 3. Checks the patient's **visit history** for previous treatments of the same ailment:
-   - If a treatment was prescribed within the last 7 days for the same ailment and the visit outcome was `UNRESOLVED` → skip that treatment (it already failed recently)
-   - If a treatment has been prescribed 3+ times for this patient-ailment pair with <30% resolution rate → mark as `exhausted` for this patient
+   - If a treatment was prescribed within the last 7 days for the same ailment and the last diagnosis outcome for that ailment-treatment pair was `no_change` or `worsened` → skip that treatment (it already failed recently)
+   - If a treatment has been prescribed 3+ times for this patient-ailment pair with <30% improvement rate → mark as `exhausted` for this patient
 4. Select the highest-ranked non-skipped, non-exhausted treatment
 5. If all treatments for an ailment are exhausted → return a `referral` response (see Referrals section)
 
-**Co-occurring ailments:** When multiple ailments are diagnosed in a single visit, treatments are selected independently per ailment. If treatments conflict (e.g., Temperature Reduction + a treatment that requires creative generation), the higher-severity ailment's treatment takes priority, and the lower-severity treatment is deferred with a `deferred_reason` in the response.
+**Uncertain diagnoses:** Diagnoses with `status: uncertain` are returned in the visit response for operator visibility but do not receive prescriptions and do not contribute to treatment effectiveness scoring unless later confirmed on another visit.
+
+**Co-occurring ailments:** When multiple ailments are diagnosed in a single visit, treatments are selected independently per confirmed ailment. If treatments conflict (e.g., Temperature Reduction + a treatment that requires creative generation), the higher-severity ailment's treatment takes priority, and the lower-severity treatment is deferred with a `deferred_reason` in the response.
 
 ### Referrals
 
-When the clinic cannot treat a patient — all treatments exhausted, or the ailment is `unverified` with no associated treatments — the visit response includes:
+When the clinic cannot treat a patient — all treatments exhausted, or the visit contains only uncertain diagnoses with no confirmed treatment path — the visit response includes:
 
 ```json
 {
@@ -422,6 +445,8 @@ When the clinic cannot treat a patient — all treatments exhausted, or the ailm
   "patient_history_summary": "..."
 }
 ```
+
+Referrals do not introduce a new visit state in MVP. The visit remains in `AWAITING_FOLLOWUP` so an operator or orchestrator can still report what happened after manual investigation.
 
 Referrals appear as alerts on the operator dashboard.
 
@@ -434,6 +459,7 @@ Agents register via `POST /patients` with metadata about their identity and envi
 ```json
 // POST /patients
 {
+  "external_agent_id": "researchbot-7-prod",
   "agent_name": "ResearchBot-7",
   "model": "claude-sonnet-4-20250514",
   "framework": "langchain",
@@ -449,9 +475,9 @@ Agents register via `POST /patients` with metadata about their identity and envi
 }
 ```
 
-**Required fields:** `agent_name`. All others are optional but improve diagnosis quality. The `environment` block is especially valuable — Context Overflow diagnosis uses `context_window` to assess capacity, and Temperature Reduction checks current temperature before prescribing.
+**Required fields:** `external_agent_id`, `agent_name`. All others are optional but improve diagnosis quality. `external_agent_id` is the canonical patient identity supplied by the calling system; `agent_name` and `owner` are human-readable metadata. The `environment` block is especially valuable — Context Overflow diagnosis uses `context_window` to assess capacity, and Temperature Reduction checks current temperature before prescribing.
 
-**Duplicate detection:** If an agent registers with the same `agent_name` + `owner` combination as an existing patient, the API returns the existing `patient_id` and updates any changed metadata fields. It does not create a duplicate record.
+**Duplicate detection:** If an agent registers with an `external_agent_id` that already exists, the API returns the existing `patient_id` and updates any changed metadata fields. It does not create a duplicate record.
 
 ### Patient Record
 
@@ -460,6 +486,7 @@ Each patient accumulates a persistent record:
 | Field | Type | Description |
 |-------|------|-------------|
 | `patient_id` | string (UUID) | Unique identifier, generated at registration |
+| `external_agent_id` | string | Stable caller-supplied identity used for deduplication across registrations |
 | `agent_name` | string | Human-readable name |
 | `model` | string \| null | Underlying LLM (e.g., "claude-sonnet-4-20250514", "gpt-4o") |
 | `framework` | string \| null | Orchestration framework (e.g., "langchain", "crew-ai", "custom") |
@@ -470,7 +497,7 @@ Each patient accumulates a persistent record:
 | `registered_at` | datetime | Registration timestamp |
 | `last_visit` | datetime \| null | Most recent visit timestamp |
 | `visit_count` | integer | Total completed visits |
-| `chronic_conditions` | string[] | Ailment codes with 3+ recurrences within 30 days. Updated automatically after each visit resolution. |
+| `chronic_conditions` | string[] | Ailment codes with 3+ recurrences within 30 days. Updated automatically whenever a newly diagnosed visit crosses the recurrence threshold. |
 | `status` | enum | `active` / `discharged` / `suspended`. Discharged patients retain records but don't appear in active dashboard views. Suspended patients are blocked from new visits (e.g., if an operator flags an agent as spam). |
 
 ### Patient History
@@ -478,13 +505,13 @@ Each patient accumulates a persistent record:
 The patient record links to a complete visit history. Visits are never deleted — only archived after 90 days of inactivity. The history enables:
 
 - **Recurrence detection:** Same ailment diagnosed within 7 days of a previous visit → `recurrence_flag: true`
-- **Chronic condition flagging:** 3+ recurrences of the same ailment within 30 days → ailment added to `chronic_conditions`
+- **Chronic condition flagging:** 3+ recurrences of the same ailment within 30 days, regardless of the prior visit outcomes → ailment added to `chronic_conditions`
 - **Treatment exhaustion tracking:** Per-patient, per-ailment record of which treatments have been tried and their outcomes
 - **Version correlation:** If an agent's `version` changes between visits and a previously chronic ailment resolves, the dashboard highlights the version change as a potential fix
 
 ## Treatment Effectiveness
 
-Treatment effectiveness is the feedback loop that makes AgentClinic improve over time. Every resolved or unresolved visit updates the effectiveness data.
+Treatment effectiveness is the feedback loop that makes AgentClinic improve over time. Every submitted diagnosis outcome updates the effectiveness data for its ailment-treatment pair.
 
 ### Effectiveness Score
 
@@ -495,10 +522,10 @@ Each ailment-treatment pair maintains an effectiveness record:
 | `ailment_code` | string | Which ailment |
 | `treatment_code` | string | Which treatment |
 | `total_prescribed` | integer | Total times this treatment was prescribed for this ailment |
-| `total_resolved` | integer | Times the follow-up outcome was `improved` |
-| `total_unresolved` | integer | Times the follow-up outcome was `no_change` or `worsened` |
-| `total_expired` | integer | Times the visit expired without follow-up |
-| `effectiveness_score` | float (0-1) | `total_resolved / (total_resolved + total_unresolved)`. Expired visits are excluded (no data ≠ failure). Null until `total_resolved + total_unresolved >= 5` (minimum sample size). |
+| `total_resolved` | integer | Times the diagnosis outcome was `improved` |
+| `total_unresolved` | integer | Times the diagnosis outcome was `no_change` or `worsened` |
+| `total_expired` | integer | Times a prescribed ailment-treatment pair never received a diagnosis outcome before the visit expired |
+| `effectiveness_score` | float (0-1) | `total_resolved / (total_resolved + total_unresolved)`. Expired prescriptions are excluded (no data ≠ failure). Null until `total_resolved + total_unresolved >= 5` (minimum sample size). |
 | `last_updated` | datetime | Most recent outcome that affected this score |
 
 ### Score Dynamics
@@ -511,7 +538,7 @@ Each ailment-treatment pair maintains an effectiveness record:
 
 Separate from per-visit effectiveness, the system tracks recurrence rates:
 
-- **Recurrence rate per ailment:** What fraction of resolved visits for ailment X are followed by another visit for the same ailment within 7 days?
+- **Recurrence rate per ailment:** What fraction of diagnosed visits for ailment X are followed by another visit for the same ailment within 7 days?
 - **Recurrence rate per treatment:** When treatment Y resolves ailment X, how often does X recur within 7 days? A treatment with low recurrence is providing durable relief, not just temporary suppression.
 
 High recurrence rates (>40%) are flagged on the dashboard. A treatment that resolves symptoms but has a high recurrence rate may be masking rather than fixing the underlying issue.
@@ -530,9 +557,10 @@ High recurrence rates (>40%) are flagged on the dashboard. A treatment that reso
 | `symptom_text` | string | Raw natural language symptom report from the agent |
 | `severity` | integer (1-4) | Assigned during triage |
 | `diagnoses` | Diagnosis[] | One or more ailment matches |
-| `prescriptions` | Prescription[] | Treatment instructions, one per diagnosis |
+| `prescriptions` | Prescription[] | Treatment instructions, one per confirmed diagnosis |
 | `followup_due` | datetime \| null | When follow-up is expected (created_at + followup_window). Null before PRESCRIBED state |
 | `followup_report` | FollowupReport \| null | Outcome data submitted by agent or orchestrator |
+| `referral` | Referral \| null | Present when the clinic cannot confidently treat the visit and recommends manual investigation |
 | `recurrence_flag` | boolean | True if same ailment was diagnosed for this patient within prior 7 days |
 | `metadata` | object \| null | Caller-provided context (task ID, conversation ID, error logs) — opaque to AgentClinic, stored for operator reference |
 
@@ -542,7 +570,8 @@ High recurrence rates (>40%) are flagged on the dashboard. A treatment that reso
 |-------|------|-------------|
 | `ailment_code` | string | Code from ailment catalog (e.g., "HAL-001") |
 | `ailment_name` | string | Human-readable name |
-| `confidence` | float (0-1) | Diagnosis confidence based on symptom pattern match. <0.6 triggers custom ailment auto-creation |
+| `status` | enum | `confirmed` / `uncertain` / `auto_detected` |
+| `confidence` | float (0-1) | Diagnosis confidence based on symptom pattern match. Custom ailment auto-creation happens only when no known ailment reaches 0.4 confidence |
 | `matched_patterns` | string[] | Which symptom patterns from the catalog matched the agent's report |
 | `severity_adjusted` | integer (1-4) | Final severity after applying ailment-specific modifiers |
 
@@ -562,9 +591,32 @@ High recurrence rates (>40%) are flagged on the dashboard. A treatment that reso
 | Field | Type | Description |
 |-------|------|-------------|
 | `submitted_at` | datetime | When the follow-up was received |
-| `outcome` | enum | `improved` / `no_change` / `worsened` / `unknown` |
-| `outcome_text` | string \| null | Optional natural language description of post-treatment state |
-| `metrics` | object \| null | Optional structured metrics (e.g., `{"hallucination_rate": 0.05, "latency_p99_ms": 1200}`) |
+| `diagnosis_outcomes` | DiagnosisOutcome[] | Outcome for each prescribed ailment-treatment pair |
+| `summary_text` | string \| null | Optional visit-level summary from the caller |
+
+Visit state aggregation after follow-up:
+- `RESOLVED` if every submitted `diagnosis_outcome` is `improved`
+- `UNRESOLVED` if any submitted `diagnosis_outcome` is `no_change` or `worsened`
+- `EXPIRED` if no follow-up is submitted before `followup_due`
+
+### Diagnosis Outcome
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ailment_code` | string | Which diagnosed ailment this outcome corresponds to |
+| `treatment_code` | string | Which prescribed treatment this outcome evaluates |
+| `outcome` | enum | `improved` / `no_change` / `worsened` |
+| `outcome_text` | string \| null | Optional natural language description of the post-treatment state for this diagnosis |
+| `metrics` | object \| null | Optional structured metrics scoped to this diagnosis outcome (e.g., `{"hallucination_rate": 0.05}`) |
+
+### Referral
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `referral` | boolean | Always `true` when present |
+| `reason` | string | Why AgentClinic could not confidently treat the visit |
+| `recommendation` | string | Manual next step for the operator or orchestrator |
+| `patient_history_summary` | string | Brief context to support manual investigation |
 
 ## Dashboard
 
@@ -607,7 +659,7 @@ Full patient chart:
 
 ### Alerts & Referrals
 
-- **Referral queue:** List of patients who triggered referrals (all treatments exhausted). Each entry shows patient, ailment, treatments tried, and history summary
+- **Referral queue:** List of patients who triggered referrals (all treatments exhausted or no confirmed treatment path). Each entry shows patient, ailment, treatments tried, and history summary
 - **Chronic condition alerts:** Patients newly flagged as chronic (3+ recurrences within 30 days)
 - **Declining treatment effectiveness:** Treatments whose effectiveness score dropped >10% in the last 30 days
 
@@ -618,8 +670,8 @@ The dashboard connects to the backend via Server-Sent Events (SSE) for live upda
 | Event | Payload | Trigger |
 |-------|---------|---------|
 | `visit_created` | `{ visit_id, patient_id, severity }` | New visit submitted |
-| `visit_resolved` | `{ visit_id, patient_id, outcome }` | Follow-up received |
-| `referral_created` | `{ patient_id, ailment_code, reason }` | Treatment exhaustion triggered referral |
+| `followup_received` | `{ visit_id, patient_id, outcomes }` | Follow-up received |
+| `referral_created` | `{ patient_id, ailment_code, reason }` | Treatment exhaustion or uncertain-only diagnosis triggered referral |
 | `chronic_flagged` | `{ patient_id, ailment_code }` | Patient's recurrence count crossed the chronic threshold |
 
 The frontend should reconnect automatically on SSE connection drop with exponential backoff (1s, 2s, 4s, max 30s).
@@ -657,7 +709,7 @@ The frontend should reconnect automatically on SSE connection drop with exponent
 | What We Measure | Success Threshold | Method |
 |-----------------|-------------------|--------|
 | **Diagnosis accuracy** | 85%+ of diagnosed ailments match what a human reviewer would identify from the same symptom text | Periodic manual review of 50 random visits. Reviewer reads symptom text, assigns ailment(s), compares to system diagnosis. |
-| **Treatment resolution rate** | 60%+ of visits with follow-up reach RESOLVED | `total_resolved / (total_resolved + total_unresolved)` across all visits with follow-up data |
+| **Treatment resolution rate** | 60%+ of prescribed diagnosis outcomes are `improved` | `total_resolved / (total_resolved + total_unresolved)` across all diagnosis outcomes with follow-up data |
 | **Follow-up completion rate** | 50%+ of visits receive a follow-up (not EXPIRED) | Track follow-up submission rate. Low rates indicate the API integration is incomplete or the follow-up window is too short. |
 | **Treatment ranking convergence** | After 50+ outcomes per ailment-treatment pair, effectiveness scores should stabilize (variance < 0.05 between rolling 10-visit windows) | Track effectiveness score over time per pair |
 | **Recurrence detection** | 100% of same-ailment visits within 7 days are flagged as recurrences | Audit `recurrence_flag` against visit history |
@@ -685,6 +737,7 @@ The frontend should reconnect automatically on SSE connection drop with exponent
 ```sql
 CREATE TABLE patients (
   patient_id TEXT PRIMARY KEY,
+  external_agent_id TEXT NOT NULL UNIQUE,
   agent_name TEXT NOT NULL,
   model TEXT,
   framework TEXT,
@@ -711,6 +764,7 @@ CREATE TABLE visits (
   prescriptions TEXT, -- JSON array of Prescription objects
   followup_due TEXT,
   followup_report TEXT, -- JSON FollowupReport object
+  referral TEXT, -- JSON Referral object
   recurrence_flag INTEGER DEFAULT 0,
   metadata TEXT -- JSON, opaque caller context
 );
@@ -750,6 +804,7 @@ CREATE TABLE ailment_treatments (
 CREATE INDEX idx_visits_patient ON visits(patient_id);
 CREATE INDEX idx_visits_state ON visits(state);
 CREATE INDEX idx_visits_created ON visits(created_at);
+CREATE INDEX idx_patients_external_agent_id ON patients(external_agent_id);
 CREATE INDEX idx_patients_owner ON patients(owner);
 CREATE INDEX idx_patients_status ON patients(status);
 ```
@@ -833,18 +888,20 @@ agentclinic/
 6. For each candidate ailment:
    a. Run diagnosis LLM call → confidence score
    b. If confidence ≥ 0.6 → confirmed diagnosis
-   c. If 0.4-0.59 → uncertain diagnosis (included, flagged)
+   c. If 0.4-0.59 → uncertain diagnosis (included, flagged, no prescription)
    d. If < 0.4 → excluded
-7. If no diagnoses → auto-create custom ailment
-8. For each confirmed diagnosis:
+7. If no known ailment reaches 0.4 confidence and the symptom text is specific enough → auto-create custom ailment
+8. If the symptom text is too vague to classify → return `422 UNDIAGNOSABLE`
+9. For each confirmed diagnosis:
    a. Load ailment-treatment pairs ranked by effectiveness
    b. Check patient history for recent failures → skip exhausted treatments
    c. Select best treatment
    d. Generate prescription with rationale
-9. Update visit state → PRESCRIBED → AWAITING_FOLLOWUP
-10. Set followup_due = now + followup_window
-11. Emit SSE event: visit_created
-12. Return complete visit record
+10. If no confirmed diagnoses remain but uncertain diagnoses exist → attach referral for manual review
+11. Update visit state → PRESCRIBED → AWAITING_FOLLOWUP
+12. Set followup_due = now + followup_window
+13. Emit SSE event: visit_created
+14. Return complete visit record
 ```
 
 Total expected latency: 2-5 seconds (dominated by 2-3 LLM calls).
@@ -854,7 +911,7 @@ Total expected latency: 2-5 seconds (dominated by 2-3 LLM calls).
 Two background processes run on a configurable interval (default: every 15 minutes, via `EXPIRE_CHECK_INTERVAL_MINUTES` env var):
 
 1. **Visit expiration:** Find visits in `AWAITING_FOLLOWUP` where `followup_due < now`. Move to EXPIRED. These are not counted as treatment failures.
-2. **Chronic condition check:** For each patient with a visit that just transitioned to UNRESOLVED, count recurrences of the same ailment in the last 30 days. If ≥ 3, add to `chronic_conditions`.
+2. **Chronic condition check:** For each patient with a newly diagnosed recurring ailment, count same-ailment visits in the last 30 days. If ≥ 3, add that ailment to `chronic_conditions` regardless of prior outcomes.
 
 Implementation: Use `setInterval` in the Next.js instrumentation hook (`instrumentation.ts`). No external job queue for MVP.
 
